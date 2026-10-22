@@ -1,0 +1,23 @@
+# Build outputs & executables
+bin/*.exe
+bin/*.pdb
+bin/*.obj
+
+# Sample & generated print/export files
+bin/*.SPL
+bin/*.spl
+bin/*.csv
+bin/*.xls
+bin/*.xlsx
+bin/*.png
+bin/*.jpg
+bin/*.jpeg
+bin/arialuni.ttf
+bin/Samples/
+
+# Visual Studio & Windows temporary files
+.vs/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
