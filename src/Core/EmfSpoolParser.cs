@@ -52,6 +52,8 @@ namespace XlsPrinter.Core
         private const uint MWT_LEFTMULTIPLY = 2;
         private const uint MWT_RIGHTMULTIPLY = 3;
 
+        private const float DIP_TO_MM = 25.4f / 96.0f;
+
         [DllImport("gdi32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr CreateFont(int nHeight, int nWidth, int nEscapement, int nOrientation, int fnWeight, uint fdwItalic, uint fdwUnderline, uint fdwStrikeOut, uint fdwCharSet, uint fdwOutputPrecision, uint fdwClipPrecision, uint fdwQuality, uint fdwPitchAndFamily, string lpszFace);
 
@@ -355,16 +357,27 @@ namespace XlsPrinter.Core
             if (data == null || data.Length < 16)
                 return doc;
 
-            // 1. Check if the print job is an OpenXPS or XPS package (ZIP archive containing [Content_Types].xml)
-            if (data.Length >= 4 && data[0] == 0x50 && data[1] == 0x4B && data[2] == 0x03 && data[3] == 0x04)
+            AppLogger.Log(string.Format("EmfSpoolParser: ParseBytes called for '{0}', Length={1} bytes", doc.DocumentTitle, data.Length));
+
+            // 1. Check if the print job is an OpenXPS or XPS package (scan first 4096 bytes for PK\x03\x04 signature)
+            int pkOffset = FindZipHeaderOffset(data);
+            if (pkOffset >= 0)
             {
-                List<ExtractedPage> xpsPages = ParseXpsPackage(data);
+                byte[] xpsData = data;
+                if (pkOffset > 0)
+                {
+                    xpsData = new byte[data.Length - pkOffset];
+                    Buffer.BlockCopy(data, pkOffset, xpsData, 0, xpsData.Length);
+                }
+                AppLogger.Log("EmfSpoolParser: Detected XPS/ZIP header at offset " + pkOffset);
+                List<ExtractedPage> xpsPages = ParseXpsPackage(xpsData);
                 if (xpsPages.Count > 0)
                 {
                     for (int i = 0; i < xpsPages.Count; i++)
                     {
                         doc.Pages.Add(xpsPages[i]);
                     }
+                    AppLogger.Log("EmfSpoolParser: XPS extraction succeeded with " + doc.Pages.Count + " pages");
                     return doc;
                 }
             }
@@ -375,6 +388,7 @@ namespace XlsPrinter.Core
 
             if (emfStreams.Count > 0)
             {
+                AppLogger.Log("EmfSpoolParser: Detected " + emfStreams.Count + " EMF stream(s)");
                 for (int i = 0; i < emfStreams.Count; i++)
                 {
                     ExtractedPage page = ParseSingleEmfPage(emfStreams[i], i + 1);
@@ -383,17 +397,38 @@ namespace XlsPrinter.Core
             }
             else
             {
+                AppLogger.Log("EmfSpoolParser: No EMF streams; testing raw text fallback...");
                 // Fallback: if the print job is raw text / line printer stream
                 ExtractedPage textPage = ParseRawTextFallback(data, 1);
                 if (textPage.Elements.Count > 0)
                 {
                     doc.Pages.Add(textPage);
+                    AppLogger.Log("EmfSpoolParser: Extracted " + textPage.Elements.Count + " raw text lines");
                 }
             }
+
+            AppLogger.Log("EmfSpoolParser: ParseBytes completed with " + doc.Pages.Count + " pages");
+            return doc;
+        }
+
+        private static int FindZipHeaderOffset(byte[] data)
+        {
+            if (data == null || data.Length < 4) return -1;
+            int limit = Math.Min(data.Length - 4, 4096);
+            for (int i = 0; i <= limit; i++)
+            {
+                if (data[i] == 0x50 && data[i + 1] == 0x4B && data[i + 2] == 0x03 && data[i + 3] == 0x04)
+                    return i;
+            }
+            return -1;
+        }
 
             return doc;
         }
 
+        /// <summary>
+        /// Parses an XPS or OpenXPS print stream (standard spool format on Windows 10/11 v4 print drivers),
+        /// extracting FixedPage Glyphs, coordinates (OriginX, OriginY, FontRenderingEmSize), and Unicode text.
         /// <summary>
         /// Parses an XPS or OpenXPS print stream (standard spool format on Windows 10/11 v4 print drivers),
         /// extracting FixedPage Glyphs, coordinates (OriginX, OriginY, FontRenderingEmSize), and Unicode text.
@@ -404,20 +439,25 @@ namespace XlsPrinter.Core
             try
             {
                 Dictionary<string, byte[]> zipEntries = ExtractZipEntries(zipData);
-                // Look for FixedPage parts: Documents/1/Pages/1.fpage, 2.fpage, etc.
+                // Look for FixedPage parts: Documents/1/Pages/1.fpage, 2.fpage, etc. (excluding _rels metadata)
                 List<string> pageKeys = new List<string>();
                 foreach (string key in zipEntries.Keys)
                 {
-                    if (key.IndexOf(".fpage", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        key.IndexOf("FixedDocument", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        key.IndexOf("/Pages/", StringComparison.OrdinalIgnoreCase) >= 0)
+                    if (key.EndsWith(".fpage", StringComparison.OrdinalIgnoreCase) &&
+                        key.IndexOf("_rels", StringComparison.OrdinalIgnoreCase) < 0)
                     {
                         pageKeys.Add(key);
                     }
                 }
 
                 // Natural sort page files (1.fpage, 2.fpage, etc.)
-                pageKeys.Sort(StringComparer.OrdinalIgnoreCase);
+                pageKeys.Sort(delegate(string a, string b)
+                {
+                    int numA = ExtractPageNumberFromPath(a);
+                    int numB = ExtractPageNumberFromPath(b);
+                    if (numA != numB) return numA.CompareTo(numB);
+                    return string.Compare(a, b, StringComparison.OrdinalIgnoreCase);
+                });
 
                 for (int p = 0; p < pageKeys.Count; p++)
                 {
@@ -437,6 +477,18 @@ namespace XlsPrinter.Core
             return pages;
         }
 
+        private static int ExtractPageNumberFromPath(string path)
+        {
+            try
+            {
+                string fn = Path.GetFileNameWithoutExtension(path);
+                int num;
+                if (int.TryParse(fn, out num)) return num;
+            }
+            catch { }
+            return 0;
+        }
+
         private ExtractedPage ParseSingleXpsPage(byte[] xmlBytes, int pageNumber)
         {
             ExtractedPage page = new ExtractedPage(pageNumber);
@@ -449,7 +501,6 @@ namespace XlsPrinter.Core
 
                 // Check page dimensions from <FixedPage Width="816" Height="1056" ...>
                 // XPS coordinates are in 1/96 inch DIPs (1 inch = 25.4 mm => 1 DIP = 0.264583 mm)
-                const float DIP_TO_MM = 25.4f / 96.0f;
 
                 System.Xml.XmlElement root = xdoc.DocumentElement;
                 if (root != null)
@@ -484,25 +535,71 @@ namespace XlsPrinter.Core
                         if (gNode.Attributes["FontRenderingEmSize"] != null)
                             float.TryParse(gNode.Attributes["FontRenderingEmSize"].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out emSize);
 
-                        float xMm = originX * DIP_TO_MM;
-                        float yMm = (originY - emSize * 0.8f) * DIP_TO_MM; // OriginY is baseline in XPS
-                        float heightMm = Math.Max(2.5f, emSize * DIP_TO_MM);
-                        float widthMm = Math.Max(3.0f, text.Length * heightMm * 0.55f);
+                        // Parse RenderTransform on Glyphs if present (e.g. MXDC scaling 0.0489424,-0,0,0.0488281,0,0)
+                        float gm11 = 1f, gm12 = 0f, gm21 = 0f, gm22 = 1f, gdx = 0f, gdy = 0f;
+                        if (gNode.Attributes["RenderTransform"] != null)
+                        {
+                            ParseMatrixString(gNode.Attributes["RenderTransform"].Value, out gm11, out gm12, out gm21, out gm22, out gdx, out gdy);
+                        }
 
-                        ExtractedTextElement elem = new ExtractedTextElement();
-                        elem.PageNumber = pageNumber;
-                        elem.Text = text.Trim();
-                        elem.X = xMm;
-                        elem.Y = yMm;
-                        elem.Width = widthMm;
-                        elem.Height = heightMm;
-                        elem.FontSize = emSize * 0.75f; // Convert 1/96 to pt (72/96)
-                        elem.FontName = "Arial";
-                        elem.IsBold = false;
-                        elem.IsRtl = ArabicTextHelper.ContainsArabic(text);
-                        elem.Selected = true;
+                        // Parse RenderTransform on parent Canvas if present
+                        float cm11 = 1f, cm12 = 0f, cm21 = 0f, cm22 = 1f, cdx = 0f, cdy = 0f;
+                        System.Xml.XmlNode parent = gNode.ParentNode;
+                        while (parent != null && parent != xdoc)
+                        {
+                            if (parent.Attributes != null && parent.Attributes["RenderTransform"] != null)
+                            {
+                                float pm11, pm12, pm21, pm22, pdx, pdy;
+                                ParseMatrixString(parent.Attributes["RenderTransform"].Value, out pm11, out pm12, out pm21, out pm22, out pdx, out pdy);
+                                cm11 *= pm11;
+                                cm22 *= pm22;
+                                cdx += pdx;
+                                cdy += pdy;
+                            }
+                            parent = parent.ParentNode;
+                        }
 
-                        page.Elements.Add(elem);
+                        float gx = originX * gm11 + originY * gm21 + gdx;
+                        float gy = originX * gm12 + originY * gm22 + gdy;
+                        float finalX = gx * cm11 + gy * cm21 + cdx;
+                        float finalY = gx * cm12 + gy * cm22 + cdy;
+                        float finalEm = emSize * Math.Abs(gm22 * cm22);
+                        if (finalEm <= 0.1f) finalEm = emSize;
+
+                        float xMm = finalX * DIP_TO_MM;
+                        float yMm = (finalY - finalEm * 0.8f) * DIP_TO_MM; // OriginY is baseline in XPS
+                        float heightMm = Math.Max(2.5f, finalEm * DIP_TO_MM);
+
+                        string indicesStr = (gNode.Attributes["Indices"] != null) ? gNode.Attributes["Indices"].Value : null;
+                        List<XpsGlyphSegment> segments = SplitXpsGlyphs(rawText, indicesStr, xMm, heightMm, finalEm, emSize, gm11, cm11);
+
+                        for (int s = 0; s < segments.Count; s++)
+                        {
+                            XpsGlyphSegment seg = segments[s];
+                            if (float.IsNaN(seg.X) || float.IsInfinity(seg.X) ||
+                                float.IsNaN(yMm) || float.IsInfinity(yMm) ||
+                                float.IsNaN(seg.Width) || float.IsInfinity(seg.Width) ||
+                                float.IsNaN(heightMm) || float.IsInfinity(heightMm))
+                                continue;
+
+                            string normText = ArabicTextHelper.NormalizeArabicText(seg.Text, NormalizePresentationForms, ReverseVisualArabic);
+                            if (string.IsNullOrEmpty(normText.Trim())) continue;
+
+                            ExtractedTextElement elem = new ExtractedTextElement();
+                            elem.PageNumber = pageNumber;
+                            elem.Text = normText.Trim();
+                            elem.X = seg.X;
+                            elem.Y = yMm;
+                            elem.Width = seg.Width;
+                            elem.Height = heightMm;
+                            elem.FontSize = finalEm * 0.75f; // Convert 1/96 to pt (72/96)
+                            elem.FontName = "Arial";
+                            elem.IsBold = false;
+                            elem.IsRtl = ArabicTextHelper.ContainsArabic(normText);
+                            elem.Selected = true;
+
+                            page.Elements.Add(elem);
+                        }
                     }
                 }
 
@@ -516,14 +613,260 @@ namespace XlsPrinter.Core
             return page;
         }
 
+        private struct XpsGlyphSegment
+        {
+            public string Text;
+            public float X;
+            public float Width;
+        }
+
+        private static List<XpsGlyphSegment> SplitXpsGlyphs(string rawText, string indicesStr, float startXMm, float heightMm, float finalEm, float emSize, float gm11, float cm11)
+        {
+            List<XpsGlyphSegment> list = new List<XpsGlyphSegment>();
+            if (string.IsNullOrEmpty(indicesStr))
+            {
+                XpsGlyphSegment seg = new XpsGlyphSegment();
+                seg.Text = rawText;
+                seg.X = startXMm;
+                seg.Width = Math.Max(3f, rawText.Length * heightMm * 0.55f);
+                list.Add(seg);
+                return list;
+            }
+
+            string[] clusters = indicesStr.Split(';');
+            float mmPerAdvanceUnit = (emSize / 100f) * Math.Abs(gm11 * cm11) * DIP_TO_MM;
+
+            bool hasLargeGap = false;
+            for (int i = 0; i < clusters.Length; i++)
+            {
+                float adv;
+                if (TryParseClusterAdvance(clusters[i], out adv))
+                {
+                    if (adv > 150f || (adv * mmPerAdvanceUnit) > (heightMm * 1.5f))
+                    {
+                        hasLargeGap = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!hasLargeGap)
+            {
+                XpsGlyphSegment seg = new XpsGlyphSegment();
+                seg.Text = rawText;
+                seg.X = startXMm;
+                seg.Width = Math.Max(3f, rawText.Length * heightMm * 0.55f);
+                list.Add(seg);
+                return list;
+            }
+
+            StringBuilder curSeg = new StringBuilder();
+            float curXMm = startXMm;
+            float segStartXMm = startXMm;
+
+            int count = Math.Min(rawText.Length, clusters.Length);
+            for (int i = 0; i < count; i++)
+            {
+                char ch = rawText[i];
+                float adv;
+                bool hasAdv = TryParseClusterAdvance(clusters[i], out adv);
+                float charWidthMm = hasAdv ? (adv * mmPerAdvanceUnit) : (heightMm * 0.55f);
+
+                bool isGap = hasAdv && (adv > 150f || charWidthMm > (heightMm * 1.5f));
+                if (isGap)
+                {
+                    curSeg.Append(ch);
+                    string segText = curSeg.ToString().Trim();
+                    if (!string.IsNullOrEmpty(segText))
+                    {
+                        XpsGlyphSegment seg = new XpsGlyphSegment();
+                        seg.Text = segText;
+                        seg.X = segStartXMm;
+                        seg.Width = Math.Max(2f, (curXMm - segStartXMm) + (heightMm * 0.55f));
+                        list.Add(seg);
+                    }
+                    curSeg.Length = 0;
+                    curXMm += charWidthMm;
+                    segStartXMm = curXMm;
+                }
+                else
+                {
+                    curSeg.Append(ch);
+                    curXMm += charWidthMm;
+                }
+            }
+
+            for (int i = count; i < rawText.Length; i++)
+            {
+                curSeg.Append(rawText[i]);
+                curXMm += (heightMm * 0.55f);
+            }
+
+            if (curSeg.Length > 0)
+            {
+                string segText = curSeg.ToString().Trim();
+                if (!string.IsNullOrEmpty(segText))
+                {
+                    XpsGlyphSegment seg = new XpsGlyphSegment();
+                    seg.Text = segText;
+                    seg.X = segStartXMm;
+                    seg.Width = Math.Max(2f, curXMm - segStartXMm);
+                    list.Add(seg);
+                }
+            }
+
+            return list;
+        }
+
+        private static bool TryParseClusterAdvance(string cluster, out float advance)
+        {
+            advance = 0f;
+            if (string.IsNullOrEmpty(cluster)) return false;
+            int comma = cluster.IndexOf(',');
+            if (comma < 0) return false;
+            int nextComma = cluster.IndexOf(',', comma + 1);
+            string s = (nextComma > 0) ? cluster.Substring(comma + 1, nextComma - comma - 1) : cluster.Substring(comma + 1);
+            return float.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out advance);
+        }
+
+        private static void ParseMatrixString(string matStr, out float m11, out float m12, out float m21, out float m22, out float dx, out float dy)
+        {
+            m11 = 1f; m12 = 0f; m21 = 0f; m22 = 1f; dx = 0f; dy = 0f;
+            if (string.IsNullOrEmpty(matStr)) return;
+            string[] parts = matStr.Split(new char[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 6)
+            {
+                float.TryParse(parts[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out m11);
+                float.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out m12);
+                float.TryParse(parts[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out m21);
+                float.TryParse(parts[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out m22);
+                float.TryParse(parts[4], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out dx);
+                float.TryParse(parts[5], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out dy);
+            }
+        }
+
         private static Dictionary<string, byte[]> ExtractZipEntries(byte[] zipData)
         {
             Dictionary<string, byte[]> entries = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+            if (zipData == null || zipData.Length < 22) return entries;
+
+            // 1. Try Central Directory parsing (handles bit 3 streaming Data Descriptors used by Windows Spooler)
+            int eocdPos = -1;
+            for (int i = zipData.Length - 22; i >= Math.Max(0, zipData.Length - 65557); i--)
+            {
+                if (BitConverter.ToUInt32(zipData, i) == 0x06054B50)
+                {
+                    eocdPos = i;
+                    break;
+                }
+            }
+
+            if (eocdPos >= 0)
+            {
+                ushort numEntries = BitConverter.ToUInt16(zipData, eocdPos + 10);
+                uint cdOffset = BitConverter.ToUInt32(zipData, eocdPos + 16);
+                int cdPos = (int)cdOffset;
+
+                Dictionary<string, SortedDictionary<int, byte[]>> pieces = new Dictionary<string, SortedDictionary<int, byte[]>>(StringComparer.OrdinalIgnoreCase);
+
+                for (int e = 0; e < numEntries && cdPos <= zipData.Length - 46; e++)
+                {
+                    if (BitConverter.ToUInt32(zipData, cdPos) != 0x02014B50) break;
+
+                    ushort method = BitConverter.ToUInt16(zipData, cdPos + 10);
+                    uint compSize = BitConverter.ToUInt32(zipData, cdPos + 20);
+                    uint uncompSize = BitConverter.ToUInt32(zipData, cdPos + 24);
+                    ushort nameLen = BitConverter.ToUInt16(zipData, cdPos + 28);
+                    ushort extraLen = BitConverter.ToUInt16(zipData, cdPos + 30);
+                    ushort commentLen = BitConverter.ToUInt16(zipData, cdPos + 32);
+                    uint localHdrOffset = BitConverter.ToUInt32(zipData, cdPos + 42);
+
+                    string name = Encoding.UTF8.GetString(zipData, cdPos + 46, nameLen);
+
+                    if (localHdrOffset + 30 <= zipData.Length)
+                    {
+                        ushort locNameLen = BitConverter.ToUInt16(zipData, (int)localHdrOffset + 26);
+                        ushort locExtraLen = BitConverter.ToUInt16(zipData, (int)localHdrOffset + 28);
+                        int dataPos = (int)localHdrOffset + 30 + locNameLen + locExtraLen;
+
+                        if (dataPos + compSize <= zipData.Length)
+                        {
+                            byte[] uncompBytes = null;
+                            if (method == 0) // Stored
+                            {
+                                uncompBytes = new byte[uncompSize];
+                                Buffer.BlockCopy(zipData, dataPos, uncompBytes, 0, (int)uncompSize);
+                            }
+                            else if (method == 8) // Deflate
+                            {
+                                try
+                                {
+                                    using (MemoryStream inMs = new MemoryStream(zipData, dataPos, (int)compSize))
+                                    using (System.IO.Compression.DeflateStream ds = new System.IO.Compression.DeflateStream(inMs, System.IO.Compression.CompressionMode.Decompress))
+                                    using (MemoryStream outMs = new MemoryStream((int)uncompSize))
+                                    {
+                                        byte[] buf = new byte[4096];
+                                        int r;
+                                        while ((r = ds.Read(buf, 0, buf.Length)) > 0) outMs.Write(buf, 0, r);
+                                        uncompBytes = outMs.ToArray();
+                                    }
+                                }
+                                catch { }
+                            }
+
+                            if (uncompBytes != null)
+                            {
+                                // Check if this is an XPS interleaved piece (e.g. path/[0].piece or path/[1].last.piece)
+                                int pieceIdx = name.IndexOf("/[");
+                                if (pieceIdx > 0 && (name.EndsWith(".piece", StringComparison.OrdinalIgnoreCase) || name.EndsWith(".last.piece", StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    string baseName = name.Substring(0, pieceIdx);
+                                    int closeBracket = name.IndexOf(']', pieceIdx);
+                                    int pNum = 0;
+                                    if (closeBracket > pieceIdx + 2)
+                                    {
+                                        int.TryParse(name.Substring(pieceIdx + 2, closeBracket - pieceIdx - 2), out pNum);
+                                    }
+                                    if (!pieces.ContainsKey(baseName)) pieces[baseName] = new SortedDictionary<int, byte[]>();
+                                    pieces[baseName][pNum] = uncompBytes;
+                                }
+                                else
+                                {
+                                    entries[name] = uncompBytes;
+                                }
+                            }
+                        }
+                    }
+
+                    cdPos += 46 + nameLen + extraLen + commentLen;
+                }
+
+                // Reassemble interleaved piece parts into unified entries
+                foreach (string baseName in pieces.Keys)
+                {
+                    SortedDictionary<int, byte[]> pieceDict = pieces[baseName];
+                    int totalLen = 0;
+                    foreach (byte[] b in pieceDict.Values) totalLen += b.Length;
+                    byte[] combined = new byte[totalLen];
+                    int offset = 0;
+                    foreach (byte[] b in pieceDict.Values)
+                    {
+                        Buffer.BlockCopy(b, 0, combined, offset, b.Length);
+                        offset += b.Length;
+                    }
+                    entries[baseName] = combined;
+                }
+
+                if (entries.Count > 0)
+                    return entries;
+            }
+
+            // 2. Fallback: Local header walking (for simple non-streamed ZIPs)
             int pos = 0;
             while (pos + 30 <= zipData.Length)
             {
                 uint sig = BitConverter.ToUInt32(zipData, pos);
-                if (sig != 0x04034B50) break; // Local file header signature
+                if (sig != 0x04034B50) break;
 
                 ushort method = BitConverter.ToUInt16(zipData, pos + 8);
                 uint compSize = BitConverter.ToUInt32(zipData, pos + 18);
@@ -534,36 +877,37 @@ namespace XlsPrinter.Core
 
                 string name = Encoding.UTF8.GetString(zipData, namePos, nameLen);
                 int dataPos = namePos + nameLen + extraLen;
-                if (dataPos + compSize > zipData.Length) break;
-
-                byte[] uncompBytes = null;
-                if (method == 0) // Stored
+                if (compSize > 0 && dataPos + compSize <= zipData.Length)
                 {
-                    uncompBytes = new byte[compSize];
-                    Buffer.BlockCopy(zipData, dataPos, uncompBytes, 0, (int)compSize);
-                }
-                else if (method == 8) // Deflate
-                {
-                    using (MemoryStream inMs = new MemoryStream(zipData, dataPos, (int)compSize))
-                    using (System.IO.Compression.DeflateStream ds = new System.IO.Compression.DeflateStream(inMs, System.IO.Compression.CompressionMode.Decompress))
-                    using (MemoryStream outMs = new MemoryStream())
+                    byte[] uncompBytes = null;
+                    if (method == 0)
                     {
-                        byte[] buf = new byte[4096];
-                        int r;
-                        while ((r = ds.Read(buf, 0, buf.Length)) > 0)
-                        {
-                            outMs.Write(buf, 0, r);
-                        }
-                        uncompBytes = outMs.ToArray();
+                        uncompBytes = new byte[compSize];
+                        Buffer.BlockCopy(zipData, dataPos, uncompBytes, 0, (int)compSize);
                     }
+                    else if (method == 8)
+                    {
+                        try
+                        {
+                            using (MemoryStream inMs = new MemoryStream(zipData, dataPos, (int)compSize))
+                            using (System.IO.Compression.DeflateStream ds = new System.IO.Compression.DeflateStream(inMs, System.IO.Compression.CompressionMode.Decompress))
+                            using (MemoryStream outMs = new MemoryStream())
+                            {
+                                byte[] buf = new byte[4096];
+                                int r;
+                                while ((r = ds.Read(buf, 0, buf.Length)) > 0) outMs.Write(buf, 0, r);
+                                uncompBytes = outMs.ToArray();
+                            }
+                        }
+                        catch { }
+                    }
+                    if (uncompBytes != null) entries[name] = uncompBytes;
+                    pos = dataPos + (int)compSize;
                 }
-
-                if (uncompBytes != null)
+                else
                 {
-                    entries[name] = uncompBytes;
+                    pos = dataPos;
                 }
-
-                pos = dataPos + (int)compSize;
             }
 
             return entries;
@@ -1111,42 +1455,86 @@ namespace XlsPrinter.Core
         {
             if (page.Elements.Count <= 1) return;
 
-            // Sort top-to-bottom, then left-to-right
+            // 1. Sort strictly top-to-bottom by CenterY, then left-to-right by X (guaranteed transitive comparator)
             page.Elements.Sort(delegate(ExtractedTextElement a, ExtractedTextElement b)
             {
-                if (Math.Abs(a.CenterY - b.CenterY) <= Math.Max(1.5f, Math.Max(a.Height, b.Height) * 0.55f))
-                    return a.X.CompareTo(b.X);
-                return a.CenterY.CompareTo(b.CenterY);
+                int cmp = a.CenterY.CompareTo(b.CenterY);
+                if (cmp != 0) return cmp;
+                return a.X.CompareTo(b.X);
             });
 
-            List<ExtractedTextElement> merged = new List<ExtractedTextElement>();
-            List<ExtractedTextElement> currentCluster = new List<ExtractedTextElement>();
-            currentCluster.Add(page.Elements[0]);
+            // 2. Group into lines based on vertical proximity
+            List<List<ExtractedTextElement>> lines = new List<List<ExtractedTextElement>>();
+            List<ExtractedTextElement> currentLine = new List<ExtractedTextElement>();
+            float currentLineCenterY = 0f;
 
-            for (int i = 1; i < page.Elements.Count; i++)
+            for (int i = 0; i < page.Elements.Count; i++)
             {
-                ExtractedTextElement next = page.Elements[i];
-                ExtractedTextElement lastInCluster = currentCluster[currentCluster.Count - 1];
-
-                bool sameLine = Math.Abs(lastInCluster.CenterY - next.CenterY) <= Math.Max(1.5f, Math.Max(lastInCluster.Height, next.Height) * 0.55f);
-                float gap = next.X - lastInCluster.Right;
-
-                // Merge if fragments sit on the same line and are touching or adjacent (gap between -4.0mm and 0.6mm)
-                if (sameLine && gap >= -4.0f && gap <= 0.6f)
+                ExtractedTextElement el = page.Elements[i];
+                if (currentLine.Count == 0)
                 {
-                    currentCluster.Add(next);
+                    currentLine.Add(el);
+                    currentLineCenterY = el.CenterY;
                 }
                 else
                 {
-                    merged.Add(MergeCluster(currentCluster));
-                    currentCluster.Clear();
-                    currentCluster.Add(next);
+                    float tol = Math.Max(1.5f, Math.Max(el.Height, currentLine[0].Height) * 0.55f);
+                    if (Math.Abs(el.CenterY - currentLineCenterY) <= tol)
+                    {
+                        currentLine.Add(el);
+                        currentLineCenterY = (currentLineCenterY * (currentLine.Count - 1) + el.CenterY) / currentLine.Count;
+                    }
+                    else
+                    {
+                        lines.Add(currentLine);
+                        currentLine = new List<ExtractedTextElement>();
+                        currentLine.Add(el);
+                        currentLineCenterY = el.CenterY;
+                    }
                 }
             }
-
-            if (currentCluster.Count > 0)
+            if (currentLine.Count > 0)
             {
-                merged.Add(MergeCluster(currentCluster));
+                lines.Add(currentLine);
+            }
+
+            // 3. For each line, sort left-to-right by X and merge adjacent fragments
+            List<ExtractedTextElement> merged = new List<ExtractedTextElement>();
+            for (int l = 0; l < lines.Count; l++)
+            {
+                List<ExtractedTextElement> line = lines[l];
+                line.Sort(delegate(ExtractedTextElement a, ExtractedTextElement b)
+                {
+                    return a.X.CompareTo(b.X);
+                });
+
+                List<ExtractedTextElement> currentCluster = new List<ExtractedTextElement>();
+                currentCluster.Add(line[0]);
+
+                for (int i = 1; i < line.Count; i++)
+                {
+                    ExtractedTextElement next = line[i];
+                    ExtractedTextElement lastInCluster = currentCluster[currentCluster.Count - 1];
+
+                    float gap = next.X - lastInCluster.Right;
+
+                    // Merge if fragments sit on the same line and are touching or adjacent (gap between -4.0mm and 0.6mm)
+                    if (gap >= -4.0f && gap <= 0.6f)
+                    {
+                        currentCluster.Add(next);
+                    }
+                    else
+                    {
+                        merged.Add(MergeCluster(currentCluster));
+                        currentCluster.Clear();
+                        currentCluster.Add(next);
+                    }
+                }
+
+                if (currentCluster.Count > 0)
+                {
+                    merged.Add(MergeCluster(currentCluster));
+                }
             }
 
             page.Elements = merged;
@@ -1241,6 +1629,12 @@ namespace XlsPrinter.Core
         private ExtractedPage ParseRawTextFallback(byte[] data, int pageNumber)
         {
             ExtractedPage page = new ExtractedPage(pageNumber);
+            if (data == null || data.Length == 0) return page;
+
+            // Reject binary streams (ZIP, XPS, PDF, EMF, or high control-byte ratio)
+            // to prevent binary garbage from producing thousands of fake cells and freezing UI
+            if (IsBinaryData(data)) return page;
+
             string content;
             if (data.Length >= 2 && data[0] == 0xFF && data[1] == 0xFE)
                 content = Encoding.Unicode.GetString(data, 2, data.Length - 2);
@@ -1293,6 +1687,30 @@ namespace XlsPrinter.Core
             }
 
             return page;
+        }
+
+        private static bool IsBinaryData(byte[] data)
+        {
+            if (data == null || data.Length == 0) return false;
+            // ZIP / XPS PK signature
+            if (data.Length >= 4 && data[0] == 0x50 && data[1] == 0x4B) return true;
+            // PDF signature
+            if (data.Length >= 4 && data[0] == 0x25 && data[1] == 0x50 && data[2] == 0x44 && data[3] == 0x46) return true;
+            // EMF signature EMR_HEADER
+            if (data.Length >= 44 && BitConverter.ToUInt32(data, 0) == 1 && BitConverter.ToUInt32(data, 40) == 0x464D4520) return true;
+
+            int sampleLen = Math.Min(data.Length, 1024);
+            int controlCount = 0;
+            for (int i = 0; i < sampleLen; i++)
+            {
+                byte b = data[i];
+                if (b == 0) return true; // Null byte indicates binary data
+                if (b < 32 && b != 9 && b != 10 && b != 13 && b != 12)
+                {
+                    controlCount++;
+                }
+            }
+            return controlCount > (sampleLen * 0.10f);
         }
 
         private static string ReadNullTerminatedUnicode(byte[] data, int offset, int maxBytes)

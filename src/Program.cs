@@ -12,6 +12,38 @@ namespace XlsPrinter
 {
     static class Program
     {
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(int dwProcessId);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+        private const int ATTACH_PARENT_PROCESS = -1;
+        private const int STD_OUTPUT_HANDLE = -11;
+        private const int STD_ERROR_HANDLE = -12;
+
+        private static void InitConsoleOutput()
+        {
+            try
+            {
+                IntPtr hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                if (hStdOut == IntPtr.Zero || hStdOut == new IntPtr(-1))
+                {
+                    AttachConsole(ATTACH_PARENT_PROCESS);
+                    hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                }
+
+                if (hStdOut != IntPtr.Zero && hStdOut != new IntPtr(-1))
+                {
+                    Microsoft.Win32.SafeHandles.SafeFileHandle handle = new Microsoft.Win32.SafeHandles.SafeFileHandle(hStdOut, false);
+                    FileStream fs = new FileStream(handle, FileAccess.Write);
+                    StreamWriter writer = new StreamWriter(fs, Encoding.UTF8);
+                    writer.AutoFlush = true;
+                    Console.SetOut(writer);
+                    Console.SetError(writer);
+                }
+            }
+            catch { }
+        }
+
         [STAThread]
         static int Main(string[] args)
         {
@@ -19,6 +51,12 @@ namespace XlsPrinter
             if (args != null && args.Length > 0)
             {
                 string firstArg = args[0].ToLowerInvariant();
+
+                if (firstArg == "--self-test" || firstArg == "--install-printer" ||
+                    firstArg == "--uninstall-printer" || firstArg == "--dump-elements" || firstArg == "--convert")
+                {
+                    InitConsoleOutput();
+                }
 
                 if (firstArg == "--self-test")
                 {
@@ -52,9 +90,36 @@ namespace XlsPrinter
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs e)
+            {
+                // Prevent crash dialog on benign paint/GDI glitches
+                if (e.Exception is System.Runtime.InteropServices.ExternalException)
+                    return;
 
-            string initialFile = (args != null && args.Length > 0 && File.Exists(args[0])) ? args[0] : null;
-            Application.Run(new MainForm(initialFile));
+                MessageBox.Show("An unexpected error occurred:\n" + e.Exception.Message,
+                    "XLS Virtual Printer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            };
+
+            string initialFile = null;
+            bool startInTray = false;
+            if (args != null && args.Length > 0)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    string a = args[i].ToLowerInvariant();
+                    if (a == "--tray" || a == "--minimized" || a == "-min" || a == "/tray" || a == "/min")
+                    {
+                        startInTray = true;
+                    }
+                    else if (File.Exists(args[i]))
+                    {
+                        initialFile = args[i];
+                    }
+                }
+            }
+
+            Application.Run(new MainForm(initialFile, startInTray));
             return 0;
         }
 
@@ -122,7 +187,7 @@ namespace XlsPrinter
         /// </summary>
         private static int RunAutomatedSelfTest()
         {
-            Console.OutputEncoding = System.Text.Encoding.UTF8;
+            try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
             Console.WriteLine("=== XLS Virtual Printer Automated Self-Test ===");
 
             // 1. Test Arabic Presentation Forms & Windows-1256 Normalization

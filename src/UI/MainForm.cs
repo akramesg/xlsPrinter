@@ -4,6 +4,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Threading;
 using System.Windows.Forms;
 using XlsPrinter.Core;
 using XlsPrinter.Spooler;
@@ -43,9 +44,16 @@ namespace XlsPrinter.UI
         private Label _lblSelectionInfo;
         private Button _btnClearRegion;
         private NotifyIcon _trayIcon;
+        private bool _isExplicitExit = false;
+        private bool _startInTray = false;
 
-        public MainForm(string initialFilePath)
+        public MainForm(string initialFilePath) : this(initialFilePath, false)
         {
+        }
+
+        public MainForm(string initialFilePath, bool startInTray)
+        {
+            _startInTray = startInTray;
             _printerManager = new VirtualPrinterManager();
             _spoolParser = new EmfSpoolParser();
             _layoutEngine = new TableLayoutEngine();
@@ -63,6 +71,15 @@ namespace XlsPrinter.UI
             else
             {
                 LoadBuiltInSamplePrintJob();
+            }
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            if (_startInTray)
+            {
+                this.BeginInvoke(new MethodInvoker(delegate { this.Hide(); }));
             }
         }
 
@@ -111,10 +128,20 @@ namespace XlsPrinter.UI
             ToolStripButton btnExportCsv = new ToolStripButton("Export to .CSV (UTF-8)");
             btnExportCsv.Click += delegate { ExportCurrentTable(".csv"); };
 
+            ToolStripSeparator sep3 = new ToolStripSeparator();
+            ToolStripButton btnViewLog = new ToolStripButton("View Debug Log");
+            btnViewLog.Click += delegate {
+                try {
+                    string logFile = AppLogger.LogFilePath;
+                    if (!File.Exists(logFile)) File.WriteAllText(logFile, "Debug log started.\r\n");
+                    System.Diagnostics.Process.Start("notepad.exe", logFile);
+                } catch { }
+            };
+
             _topToolbar.Items.AddRange(new ToolStripItem[] {
                 btnInstallPrinter, btnTestPrint, btnOpenSpl, sep1,
                 btnSelectAllRows, btnDeselectAllRows, sep2,
-                btnExportXls, btnExportXlsx, btnExportCsv
+                btnExportXls, btnExportXlsx, btnExportCsv, sep3, btnViewLog
             });
 
             // Status Bar
@@ -294,13 +321,33 @@ namespace XlsPrinter.UI
             // System Tray Icon so it can sit quietly waiting for print jobs from classic Win32 apps
             _trayIcon = new NotifyIcon();
             _trayIcon.Icon = SystemIcons.Application;
-            _trayIcon.Text = "XLS Virtual Printer Watcher";
+            _trayIcon.Text = "XLS Virtual Printer (Listening for Jobs)";
             _trayIcon.Visible = true;
             _trayIcon.DoubleClick += delegate {
-                this.Show();
-                this.WindowState = FormWindowState.Normal;
-                this.Activate();
+                ShowAndActivate();
             };
+
+            ContextMenu trayMenu = new ContextMenu();
+            trayMenu.MenuItems.Add(new MenuItem("Open XLS Virtual Printer", delegate {
+                ShowAndActivate();
+            }));
+
+            MenuItem autoStartItem = new MenuItem("Start with Windows");
+            autoStartItem.Checked = IsAutoStartEnabled();
+            autoStartItem.Click += delegate {
+                bool newState = !autoStartItem.Checked;
+                SetAutoStart(newState);
+                autoStartItem.Checked = newState;
+            };
+            trayMenu.MenuItems.Add(autoStartItem);
+
+            trayMenu.MenuItems.Add("-");
+            trayMenu.MenuItems.Add(new MenuItem("Exit", delegate {
+                _isExplicitExit = true;
+                this.Close();
+                Application.Exit();
+            }));
+            _trayIcon.ContextMenu = trayMenu;
         }
 
         private void UpdatePrinterInstallStatus()
@@ -347,21 +394,51 @@ namespace XlsPrinter.UI
 
         private void LoadSpoolOrEmfFile(string filePath)
         {
-            try
+            _statusLabel.Text = "Loading print job: " + Path.GetFileName(filePath) + "...";
+            this.Cursor = Cursors.WaitCursor;
+
+            bool normForms = _chkNormalizeArabicForms.Checked;
+            bool revArabic = _chkReverseVisualArabic.Checked;
+            bool revCols = _chkReverseColumns.Checked;
+
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                _spoolParser.NormalizePresentationForms = _chkNormalizeArabicForms.Checked;
-                _spoolParser.ReverseVisualArabic = _chkReverseVisualArabic.Checked;
-                _currentDocument = _spoolParser.ParseFile(filePath);
-                _currentPageIndex = 0;
-                _selectionRegionMm = null;
-                RebuildTableFromDocument();
-                _previewCanvas.Invalidate();
-                _statusLabel.Text = "Loaded print job from: " + filePath;
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "Error parsing file:\n" + ex.Message, "Load Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+                try
+                {
+                    EmfSpoolParser parser = new EmfSpoolParser();
+                    parser.NormalizePresentationForms = normForms;
+                    parser.ReverseVisualArabic = revArabic;
+
+                    PrintJobDocument doc = parser.ParseFile(filePath);
+
+                    TableLayoutEngine layout = new TableLayoutEngine();
+                    layout.ReverseColumnsForRtl = revCols;
+                    ReconstructedTable table = (doc.Pages.Count > 0)
+                        ? layout.BuildTable(doc, 0, null)
+                        : null;
+
+                    this.BeginInvoke(new MethodInvoker(delegate
+                    {
+                        this.Cursor = Cursors.Default;
+                        _currentDocument = doc;
+                        _currentPageIndex = 0;
+                        _selectionRegionMm = null;
+                        _currentTable = table;
+
+                        ApplyReconstructedTableToGrid();
+                        _previewCanvas.Invalidate();
+                        _statusLabel.Text = "Loaded print job from: " + filePath;
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    this.BeginInvoke(new MethodInvoker(delegate
+                    {
+                        this.Cursor = Cursors.Default;
+                        MessageBox.Show(this, "Error parsing file:\n" + ex.Message, "Load Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }));
+                }
+            });
         }
 
         private void ReloadDocumentWithArabicSettings()
@@ -378,6 +455,15 @@ namespace XlsPrinter.UI
             }
         }
 
+        public void ShowAndActivate()
+        {
+            this.Show();
+            if (this.WindowState == FormWindowState.Minimized)
+                this.WindowState = FormWindowState.Normal;
+            this.BringToFront();
+            this.Activate();
+        }
+
         private void OnPrintJobCaptured(object sender, PrintJobCapturedEventArgs e)
         {
             if (this.InvokeRequired)
@@ -386,21 +472,74 @@ namespace XlsPrinter.UI
                 return;
             }
 
-            // Bring window to foreground when a classic Win32 app prints to "XLS Virtual Printer"
-            if (this.WindowState == FormWindowState.Minimized)
-                this.WindowState = FormWindowState.Normal;
-            this.Activate();
+            AppLogger.Log(string.Format("MainForm: OnPrintJobCaptured received for Job #{0} '{1}' ({2} bytes)",
+                e.JobId, e.DocumentTitle, e.SpoolBytes != null ? e.SpoolBytes.Length : 0));
 
-            _spoolParser.NormalizePresentationForms = _chkNormalizeArabicForms.Checked;
-            _spoolParser.ReverseVisualArabic = _chkReverseVisualArabic.Checked;
-            _currentDocument = _spoolParser.ParseBytes(e.SpoolBytes, e.DocumentTitle);
-            _currentPageIndex = 0;
-            _selectionRegionMm = null;
-            RebuildTableFromDocument();
-            _previewCanvas.Invalidate();
+            // Bring window to foreground even if minimized or hidden in system tray
+            ShowAndActivate();
 
-            _statusLabel.Text = string.Format("Captured Print Job #{0}: '{1}' ({2} pages)",
-                e.JobId, e.DocumentTitle, _currentDocument.Pages.Count);
+            _statusLabel.Text = string.Format("Processing captured job #{0}: '{1}'...", e.JobId, e.DocumentTitle);
+            this.Cursor = Cursors.WaitCursor;
+
+            bool normForms = _chkNormalizeArabicForms.Checked;
+            bool revArabic = _chkReverseVisualArabic.Checked;
+            bool revCols = _chkReverseColumns.Checked;
+
+            // Process parsing & layout on background thread so the UI thread NEVER hangs or says (Not Responding)
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    AppLogger.Log("WorkerThread: Starting spool parsing...");
+                    EmfSpoolParser parser = new EmfSpoolParser();
+                    parser.NormalizePresentationForms = normForms;
+                    parser.ReverseVisualArabic = revArabic;
+
+                    PrintJobDocument doc = parser.ParseBytes(e.SpoolBytes, e.DocumentTitle);
+                    AppLogger.Log(string.Format("WorkerThread: ParseBytes finished with {0} page(s)", doc.Pages.Count));
+
+                    TableLayoutEngine layout = new TableLayoutEngine();
+                    layout.ReverseColumnsForRtl = revCols;
+                    ReconstructedTable table = (doc.Pages.Count > 0)
+                        ? layout.BuildTable(doc, 0, null)
+                        : null;
+                    AppLogger.Log(string.Format("WorkerThread: BuildTable finished: {0} rows x {1} cols",
+                        table != null ? table.Rows.Count : 0, table != null ? table.ColumnHeaders.Count : 0));
+
+                    this.BeginInvoke(new MethodInvoker(delegate
+                    {
+                        try
+                        {
+                            AppLogger.Log("UI: Applying table and preview...");
+                            this.Cursor = Cursors.Default;
+                            _currentDocument = doc;
+                            _currentPageIndex = 0;
+                            _selectionRegionMm = null;
+                            _currentTable = table;
+
+                            ApplyReconstructedTableToGrid();
+                            _previewCanvas.Invalidate();
+
+                            _statusLabel.Text = string.Format("Captured Print Job #{0}: '{1}' ({2} pages, {3} rows)",
+                                e.JobId, e.DocumentTitle, doc.Pages.Count, (table != null ? table.Rows.Count : 0));
+                            AppLogger.Log("UI: Job capture successfully displayed in grid and canvas!");
+                        }
+                        catch (Exception uiex)
+                        {
+                            AppLogger.Log("UI Exception during job display: " + uiex.ToString());
+                        }
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Log("WorkerThread Exception: " + ex.ToString());
+                    this.BeginInvoke(new MethodInvoker(delegate
+                    {
+                        this.Cursor = Cursors.Default;
+                        _statusLabel.Text = "Error processing print job: " + ex.Message;
+                    }));
+                }
+            });
         }
 
         private void RebuildTableFromDocument()
@@ -409,6 +548,13 @@ namespace XlsPrinter.UI
 
             _layoutEngine.ReverseColumnsForRtl = _chkReverseColumns.Checked;
             _currentTable = _layoutEngine.BuildTable(_currentDocument, 0, _selectionRegionMm);
+
+            ApplyReconstructedTableToGrid();
+        }
+
+        private void ApplyReconstructedTableToGrid()
+        {
+            if (_currentTable == null) return;
 
             // Populate Columns CheckList
             _columnsCheckList.ItemCheck -= OnColumnItemCheck;
@@ -425,58 +571,83 @@ namespace XlsPrinter.UI
 
         private void PopulateDataGrid()
         {
-            _dataGrid.SuspendLayout();
-            _dataGrid.Columns.Clear();
-            _dataGrid.Rows.Clear();
-
-            if (_currentTable == null)
+            try
             {
-                _dataGrid.ResumeLayout();
-                return;
-            }
+                _dataGrid.SuspendLayout();
+                _dataGrid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None; // Prevent per-row layout freeze
+                _dataGrid.Columns.Clear();
+                _dataGrid.Rows.Clear();
 
-            DataGridViewCheckBoxColumn chkCol = new DataGridViewCheckBoxColumn();
-            chkCol.Name = "_ExportRow";
-            chkCol.HeaderText = "Export";
-            chkCol.Width = 50;
-            _dataGrid.Columns.Add(chkCol);
+                if (_currentTable == null || _currentTable.ColumnHeaders == null || _currentTable.ColumnHeaders.Count == 0)
+                {
+                    return;
+                }
 
-            for (int c = 0; c < _currentTable.ColumnHeaders.Count; c++)
-            {
-                DataGridViewTextBoxColumn txtCol = new DataGridViewTextBoxColumn();
-                txtCol.Name = "Col_" + c;
-                txtCol.HeaderText = _currentTable.ColumnHeaders[c];
-                txtCol.Visible = _currentTable.SelectedColumns[c];
-                _dataGrid.Columns.Add(txtCol);
-            }
+                DataGridViewCheckBoxColumn chkCol = new DataGridViewCheckBoxColumn();
+                chkCol.Name = "_ExportRow";
+                chkCol.HeaderText = "Export";
+                chkCol.Width = 50;
+                _dataGrid.Columns.Add(chkCol);
 
-            for (int r = 0; r < _currentTable.Rows.Count; r++)
-            {
-                GridRowData rowData = _currentTable.Rows[r];
-                object[] values = new object[1 + _currentTable.ColumnHeaders.Count];
-                values[0] = rowData.Selected;
                 for (int c = 0; c < _currentTable.ColumnHeaders.Count; c++)
                 {
-                    values[1 + c] = (c < rowData.Cells.Length) ? rowData.Cells[c].Text : "";
+                    DataGridViewTextBoxColumn txtCol = new DataGridViewTextBoxColumn();
+                    txtCol.Name = "Col_" + c;
+                    txtCol.HeaderText = _currentTable.ColumnHeaders[c];
+                    txtCol.Visible = (c < _currentTable.SelectedColumns.Count) ? _currentTable.SelectedColumns[c] : true;
+                    _dataGrid.Columns.Add(txtCol);
                 }
-                int rowIdx = _dataGrid.Rows.Add(values);
-                if (rowData.Cells.Length > 0)
-                {
-                    bool anyBold = false;
-                    for (int c = 0; c < rowData.Cells.Length; c++)
-                    {
-                        if (rowData.Cells[c].IsBold) { anyBold = true; break; }
-                    }
-                    if (anyBold)
-                    {
-                        _dataGrid.Rows[rowIdx].DefaultCellStyle.Font = new Font(_dataGrid.Font, FontStyle.Bold);
-                    }
-                }
-            }
 
-            _dataGrid.ResumeLayout();
-            _statusLabel.Text = string.Format("Extracted {0} rows x {1} columns. Edit cells or uncheck rows/columns before exporting to .XLS.",
-                _currentTable.Rows.Count, _currentTable.ColumnHeaders.Count);
+                Font boldFont = null;
+                try { boldFont = new Font(_dataGrid.Font, FontStyle.Bold); } catch { }
+
+                // Build all rows in memory first and add in batch with Rows.AddRange for maximum speed
+                DataGridViewRow[] gridRows = new DataGridViewRow[_currentTable.Rows.Count];
+                for (int r = 0; r < _currentTable.Rows.Count; r++)
+                {
+                    GridRowData rowData = _currentTable.Rows[r];
+                    DataGridViewRow row = new DataGridViewRow();
+                    row.CreateCells(_dataGrid);
+                    row.Cells[0].Value = rowData.Selected;
+
+                    bool anyBold = false;
+                    for (int c = 0; c < _currentTable.ColumnHeaders.Count; c++)
+                    {
+                        if (c < rowData.Cells.Length)
+                        {
+                            row.Cells[1 + c].Value = rowData.Cells[c].Text;
+                            if (rowData.Cells[c].IsBold) anyBold = true;
+                        }
+                        else
+                        {
+                            row.Cells[1 + c].Value = "";
+                        }
+                    }
+                    if (anyBold && boldFont != null)
+                    {
+                        row.DefaultCellStyle.Font = boldFont;
+                    }
+                    gridRows[r] = row;
+                }
+
+                _dataGrid.Rows.AddRange(gridRows);
+                try
+                {
+                    _dataGrid.AutoResizeColumns(DataGridViewAutoSizeColumnsMode.DisplayedCells);
+                }
+                catch { }
+
+                _statusLabel.Text = string.Format("Extracted {0} rows x {1} columns. Edit cells or uncheck rows/columns before exporting to .XLS.",
+                    _currentTable.Rows.Count, _currentTable.ColumnHeaders.Count);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Log("PopulateDataGrid Exception: " + ex.ToString());
+            }
+            finally
+            {
+                _dataGrid.ResumeLayout();
+            }
         }
 
         private void OnColumnItemCheck(object sender, ItemCheckEventArgs e)
@@ -549,26 +720,35 @@ namespace XlsPrinter.UI
 
         private void OnPreviewCanvasPaint(object sender, PaintEventArgs e)
         {
-            Graphics g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.HighQuality;
-            g.Clear(Color.FromArgb(95, 102, 112));
-
-            if (_currentDocument == null || _currentDocument.Pages.Count == 0)
-                return;
-
-            ExtractedPage page = _currentDocument.Pages[_currentPageIndex];
-            RectangleF pageRect = GetPageScreenRect(page);
-
-            // Drop shadow + White Paper
-            using (SolidBrush shadowBrush = new SolidBrush(Color.Black))
-            using (SolidBrush paperBrush = new SolidBrush(Color.White))
+            try
             {
-                g.FillRectangle(shadowBrush, pageRect.X + 4, pageRect.Y + 4, pageRect.Width, pageRect.Height);
-                g.FillRectangle(paperBrush, pageRect.X, pageRect.Y, pageRect.Width, pageRect.Height);
-            }
+                if (_previewCanvas == null || _previewCanvas.ClientSize.Width <= 10 || _previewCanvas.ClientSize.Height <= 10)
+                    return;
 
-            float scaleX = pageRect.Width / Math.Max(1f, page.Width);
-            float scaleY = pageRect.Height / Math.Max(1f, page.Height);
+                Graphics g = e.Graphics;
+                g.SmoothingMode = SmoothingMode.HighQuality;
+                g.Clear(Color.FromArgb(95, 102, 112));
+
+                if (_currentDocument == null || _currentDocument.Pages.Count == 0)
+                    return;
+
+                if (_currentPageIndex < 0 || _currentPageIndex >= _currentDocument.Pages.Count)
+                    return;
+
+                ExtractedPage page = _currentDocument.Pages[_currentPageIndex];
+                if (page == null) return;
+                RectangleF pageRect = GetPageScreenRect(page);
+
+                // Drop shadow + White Paper
+                using (SolidBrush shadowBrush = new SolidBrush(Color.Black))
+                using (SolidBrush paperBrush = new SolidBrush(Color.White))
+                {
+                    g.FillRectangle(shadowBrush, pageRect.X + 4, pageRect.Y + 4, pageRect.Width, pageRect.Height);
+                    g.FillRectangle(paperBrush, pageRect.X, pageRect.Y, pageRect.Width, pageRect.Height);
+                }
+
+                float scaleX = pageRect.Width / Math.Max(1f, page.Width);
+                float scaleY = pageRect.Height / Math.Max(1f, page.Height);
 
             // Render actual EMF metafile if available
             if (page.RawEmfBytes != null && page.RawEmfBytes.Length > 0)
@@ -600,26 +780,63 @@ namespace XlsPrinter.UI
                     for (int i = 0; i < page.Elements.Count; i++)
                     {
                         ExtractedTextElement el = page.Elements[i];
-                        if (string.IsNullOrEmpty(el.Text)) continue;
+                        if (el == null || string.IsNullOrEmpty(el.Text)) continue;
 
                         bool isArabic = el.IsRtl || ArabicTextHelper.ContainsArabic(el.Text);
                         if (isArabic)
                         {
-                            float sx = pageRect.X + el.X * scaleX;
-                            float sy = pageRect.Y + el.Y * scaleY;
-                            float sw = Math.Max(4f, el.Width * scaleX);
-                            float sh = Math.Max(4f, el.Height * scaleY);
-                            RectangleF textRect = new RectangleF(sx - 1.5f, sy - 1f, sw + 3f, sh + 2f);
-
-                            // Blank out inverted raw EMF glyphs underneath
-                            g.FillRectangle(textCoverBrush, textRect);
-
-                            // Draw clean, properly shaped and oriented Arabic text
-                            float pixelSize = Math.Max(9f, Math.Min(64f, sh * 0.85f));
-                            FontStyle fs = el.IsBold ? FontStyle.Bold : FontStyle.Regular;
-                            using (Font font = new Font("Tahoma", pixelSize, fs, GraphicsUnit.Pixel))
+                            try
                             {
-                                g.DrawString(el.Text, font, textBrush, textRect, rtlFmt);
+                                float sx = pageRect.X + el.X * scaleX;
+                                float sy = pageRect.Y + el.Y * scaleY;
+                                float sw = Math.Max(4f, el.Width * scaleX);
+                                float sh = Math.Max(4f, el.Height * scaleY);
+
+                                if (float.IsNaN(sx) || float.IsInfinity(sx) || float.IsNaN(sy) || float.IsInfinity(sy) ||
+                                    float.IsNaN(sw) || float.IsInfinity(sw) || float.IsNaN(sh) || float.IsInfinity(sh) ||
+                                    sw <= 0f || sh <= 0f)
+                                    continue;
+
+                                RectangleF textRect = new RectangleF(sx - 1.5f, sy - 1f, sw + 3f, sh + 2f);
+
+                                // Blank out inverted raw EMF glyphs underneath
+                                g.FillRectangle(textCoverBrush, textRect);
+
+                                // Draw clean, properly shaped and oriented Arabic text
+                                float pixelSize = Math.Max(8f, Math.Min(48f, sh * 0.85f));
+                                FontStyle fs = el.IsBold ? FontStyle.Bold : FontStyle.Regular;
+
+                                Rectangle cellRect = new Rectangle(
+                                    (int)Math.Floor(textRect.X),
+                                    (int)Math.Floor(textRect.Y),
+                                    (int)Math.Ceiling(textRect.Width),
+                                    (int)Math.Ceiling(textRect.Height));
+
+                                using (Font font = new Font("Tahoma", pixelSize, fs, GraphicsUnit.Pixel))
+                                {
+                                    // Prefer native Win32 GDI TextRenderer (DrawTextExW) which handles RTL/Arabic reliably
+                                    // and avoids the known GDI+ DrawString ExternalException on Windows 10/11
+                                    try
+                                    {
+                                        TextFormatFlags flags = TextFormatFlags.RightToLeft | TextFormatFlags.Right |
+                                                                TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine |
+                                                                TextFormatFlags.NoClipping | TextFormatFlags.NoPrefix;
+                                        TextRenderer.DrawText(g, el.Text, font, cellRect, Color.FromArgb(20, 20, 20), flags);
+                                    }
+                                    catch
+                                    {
+                                        // Fallback to GDI+ DrawString with guarded exception handling
+                                        try
+                                        {
+                                            g.DrawString(el.Text, font, textBrush, textRect, rtlFmt);
+                                        }
+                                        catch { }
+                                    }
+                                }
+                            }
+                            catch
+                            {
+                                // Safeguard: Individual element drawing error must never crash canvas paint
                             }
                         }
                     }
@@ -633,6 +850,7 @@ namespace XlsPrinter.UI
                 for (int i = 0; i < page.Elements.Count; i++)
                 {
                     ExtractedTextElement el = page.Elements[i];
+                    if (el == null) continue;
                     RectangleF elMm = new RectangleF(el.X, el.Y, Math.Max(2f, el.Width), Math.Max(2f, el.Height));
                     bool insideFilter = !_selectionRegionMm.HasValue || _selectionRegionMm.Value.IntersectsWith(elMm);
 
@@ -641,7 +859,10 @@ namespace XlsPrinter.UI
                     float sw = Math.Max(4f, el.Width * scaleX);
                     float sh = Math.Max(4f, el.Height * scaleY);
 
-                    g.DrawRectangle(insideFilter ? activeBoxPen : excludedBoxPen, sx, sy, sw, sh);
+                    if (!float.IsNaN(sx) && !float.IsNaN(sy) && !float.IsNaN(sw) && !float.IsNaN(sh))
+                    {
+                        g.DrawRectangle(insideFilter ? activeBoxPen : excludedBoxPen, sx, sy, sw, sh);
+                    }
                 }
             }
 
@@ -674,6 +895,11 @@ namespace XlsPrinter.UI
                     g.FillRectangle(dragBrush, dragRect);
                     g.DrawRectangle(dragPen, dragRect);
                 }
+            }
+            }
+            catch
+            {
+                // Never allow a GDI / paint glitch to crash the WinForms message loop
             }
         }
 
@@ -812,8 +1038,65 @@ namespace XlsPrinter.UI
             return name;
         }
 
+        private const string RunRegistryKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string RunValueName = "XlsVirtualPrinter";
+
+        public static bool IsAutoStartEnabled()
+        {
+            try
+            {
+                using (Microsoft.Win32.RegistryKey key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunRegistryKey, false))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(RunValueName);
+                        return val != null;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        public static void SetAutoStart(bool enable)
+        {
+            try
+            {
+                using (Microsoft.Win32.RegistryKey key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunRegistryKey, true))
+                {
+                    if (key != null)
+                    {
+                        if (enable)
+                        {
+                            string exePath = Application.ExecutablePath;
+                            key.SetValue(RunValueName, "\"" + exePath + "\" --tray");
+                        }
+                        else
+                        {
+                            key.DeleteValue(RunValueName, false);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            if (e.CloseReason == CloseReason.UserClosing && !_isExplicitExit)
+            {
+                // Minimize to System Tray instead of terminating so background print watcher stays active
+                e.Cancel = true;
+                this.Hide();
+                if (_trayIcon != null)
+                {
+                    _trayIcon.ShowBalloonTip(1500, "XLS Virtual Printer",
+                        "Still listening in system tray. Print jobs will automatically pop up here.",
+                        ToolTipIcon.Info);
+                }
+                return;
+            }
+
             if (_trayIcon != null)
             {
                 _trayIcon.Visible = false;

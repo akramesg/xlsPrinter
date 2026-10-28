@@ -12,6 +12,7 @@ bin/*.xlsx
 bin/*.png
 bin/*.jpg
 bin/*.jpeg
+bin/*.log
 bin/arialuni.ttf
 bin/Samples/
 
@@ -19,5 +20,6 @@ bin/Samples/
 .vs/
 *.user
 *.suo
+*.log
 Thumbs.db
 Desktop.ini

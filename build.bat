@@ -21,8 +21,9 @@ if exist "%CSC35%" (
 
 echo Using Compiler: %CSC%
 
-"%CSC%" /nologo /platform:x86 /target:exe /optimize+ /out:"bin\XlsVirtualPrinter.exe" ^
+"%CSC%" /nologo /codepage:65001 /platform:x86 /target:winexe /optimize+ /out:"bin\XlsVirtualPrinter.exe" ^
     /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Data.dll /r:System.Xml.dll ^
+    "src\Core\AppLogger.cs" ^
     "src\Core\PrintModels.cs" ^
     "src\Core\ArabicTextHelper.cs" ^
     "src\Core\EmfSpoolParser.cs" ^
@@ -41,4 +42,10 @@ if errorlevel 1 (
 
 copy /Y "src\App.config" "bin\XlsVirtualPrinter.exe.config" >nul
 echo [SUCCESS] Built bin\XlsVirtualPrinter.exe (32-bit x86)
+
+if exist "\\mailserver\Shared\akram" (
+    copy /Y "bin\XlsVirtualPrinter.exe" "\\mailserver\Shared\akram\XlsVirtualPrinter.exe" >nul
+    copy /Y "bin\XlsVirtualPrinter.exe.config" "\\mailserver\Shared\akram\XlsVirtualPrinter.exe.config" >nul
+    echo [SYNC] Updated \\mailserver\Shared\akram\XlsVirtualPrinter.exe
+)
 exit /b 0

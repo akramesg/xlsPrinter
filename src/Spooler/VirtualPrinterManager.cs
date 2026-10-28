@@ -605,6 +605,8 @@ namespace XlsPrinter.Spooler
                             if ((job.Status & JOB_STATUS_SPOOLING) != 0)
                                 continue;
 
+                            XlsPrinter.Core.AppLogger.Log(string.Format("SpoolWatcher: Detected new print job #{0}: '{1}'", jobId, job.pDocument));
+
                             string splPath = FindSpoolFileForJob(spoolFolder, jobId);
                             if (!string.IsNullOrEmpty(splPath) && File.Exists(splPath))
                             {
@@ -612,6 +614,7 @@ namespace XlsPrinter.Spooler
                                 if (bytes != null && bytes.Length > 0)
                                 {
                                     _processedJobIds[jobId] = DateTime.Now;
+                                    XlsPrinter.Core.AppLogger.Log(string.Format("SpoolWatcher: Read {0} bytes from {1}", bytes.Length, splPath));
 
                                     // Delete the completed job from the queue so it doesn't clutter the spooler
                                     SetJob(hPrinter, job.JobId, 0, IntPtr.Zero, JOB_CONTROL_DELETE);
@@ -623,9 +626,18 @@ namespace XlsPrinter.Spooler
                                         args.DocumentTitle = job.pDocument ?? ("Job #" + jobId);
                                         args.SpoolFilePath = splPath;
                                         args.SpoolBytes = bytes;
+                                        XlsPrinter.Core.AppLogger.Log(string.Format("SpoolWatcher: Firing JobCaptured event for job #{0}", jobId));
                                         JobCaptured(this, args);
                                     }
                                 }
+                                else
+                                {
+                                    XlsPrinter.Core.AppLogger.Log(string.Format("SpoolWatcher: Failed to read spool file {0}", splPath));
+                                }
+                            }
+                            else
+                            {
+                                XlsPrinter.Core.AppLogger.Log(string.Format("SpoolWatcher: Spool file for job #{0} not found in {1}", jobId, spoolFolder));
                             }
                         }
                     }
