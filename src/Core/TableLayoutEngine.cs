@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
 using System.Text;
 
 namespace XlsPrinter.Core
@@ -92,12 +93,18 @@ namespace XlsPrinter.Core
         public float RowVerticalToleranceMm { get; set; }
         public float ColumnHorizontalToleranceMm { get; set; }
         public bool ReverseColumnsForRtl { get; set; }
+        public bool EliminateRepeatedHeadersAndFooters { get; set; }
+        public bool ReverseVisualArabic { get; set; }
+        public bool NormalizePresentationForms { get; set; }
 
         public TableLayoutEngine()
         {
             RowVerticalToleranceMm = 2.2f;       // Elements within 2.2mm vertically belong to the same row
             ColumnHorizontalToleranceMm = 8.0f;  // Elements within 8mm horizontally snap to the same column
             ReverseColumnsForRtl = false;
+            EliminateRepeatedHeadersAndFooters = true;
+            ReverseVisualArabic = true;
+            NormalizePresentationForms = true;
         }
 
         /// <summary>
@@ -333,6 +340,10 @@ namespace XlsPrinter.Core
                 table.ColumnHeaders.Add(GetExcelColumnName(i));
                 table.SelectedColumns.Add(true);
             }
+            if (EliminateRepeatedHeadersAndFooters)
+            {
+                prelimRows = RemoveRepeatedHeadersAndFooters(prelimRows);
+            }
 
             for (int r = 0; r < prelimRows.Count; r++)
             {
@@ -344,12 +355,239 @@ namespace XlsPrinter.Core
                 finalRow.Selected = srcRow.Selected;
                 for (int i = 0; i < nonEmptyColIndices.Count; i++)
                 {
-                    finalRow.Cells[i] = srcRow.Cells[nonEmptyColIndices[i]];
+                    GridCellData cell = srcRow.Cells[nonEmptyColIndices[i]];
+                    if (cell != null && !string.IsNullOrEmpty(cell.Text) && ArabicTextHelper.ContainsArabic(cell.Text))
+                    {
+                        cell.Text = ArabicTextHelper.NormalizeArabicText(cell.Text, NormalizePresentationForms, ReverseVisualArabic);
+                    }
+                    finalRow.Cells[i] = cell;
                 }
                 table.Rows.Add(finalRow);
             }
 
             return table;
+        }
+
+        private List<GridRowData> RemoveRepeatedHeadersAndFooters(List<GridRowData> rows)
+        {
+            if (rows == null || rows.Count == 0) return rows;
+
+            int maxPage = 1;
+            for (int r = 0; r < rows.Count; r++)
+            {
+                if (rows[r].PageNumber > maxPage) maxPage = rows[r].PageNumber;
+            }
+
+            if (maxPage <= 1) return rows;
+
+            // 1. Identify the header Y limit and signatures from Page 1
+            // Header block includes all rows up to and including the table column headers
+            HashSet<string> page1HeaderSignatures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> headerCellTexts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            float headerYLimit = 0f;
+
+            for (int r = 0; r < rows.Count; r++)
+            {
+                GridRowData row = rows[r];
+                if (row.PageNumber != 1) break;
+
+                if (IsColumnHeaderRow(row))
+                {
+                    if (row.Y > headerYLimit)
+                        headerYLimit = row.Y;
+                }
+            }
+
+            // Fallback: if no explicit column header matched, use first data row Y
+            if (headerYLimit <= 0f)
+            {
+                for (int r = 0; r < rows.Count; r++)
+                {
+                    GridRowData row = rows[r];
+                    if (row.PageNumber != 1) break;
+                    if (IsLikelyDataRow(row))
+                    {
+                        headerYLimit = row.Y - 1.0f;
+                        break;
+                    }
+                }
+            }
+            if (headerYLimit <= 0f) headerYLimit = 48.0f;
+            headerYLimit += 3.0f; // tolerance margin
+
+            // Collect all header row signatures from Page 1 within headerYLimit
+            for (int r = 0; r < rows.Count; r++)
+            {
+                GridRowData row = rows[r];
+                if (row.PageNumber != 1) break;
+
+                if (row.Y <= headerYLimit)
+                {
+                    string sig = GetRowSignature(row);
+                    if (!string.IsNullOrEmpty(sig))
+                        page1HeaderSignatures.Add(sig);
+
+                    for (int c = 0; c < row.Cells.Length; c++)
+                    {
+                        string t = (row.Cells[c].Text ?? string.Empty).Trim();
+                        if (t.Length >= 2)
+                            headerCellTexts.Add(t);
+                    }
+                }
+            }
+
+            // 2. Filter rows across all pages
+            List<GridRowData> filtered = new List<GridRowData>();
+            for (int r = 0; r < rows.Count; r++)
+            {
+                GridRowData row = rows[r];
+
+                // Remove page footer (page numbers like "صفحة 1 من 11", "Page 1 of 11")
+                if (IsPageFooterRow(row, row.PageNumber, maxPage))
+                {
+                    continue;
+                }
+
+                // For subsequent pages (Page > 1), remove repeated headers within the header region
+                if (row.PageNumber > 1 && row.Y <= headerYLimit)
+                {
+                    string sig = GetRowSignature(row);
+                    if (page1HeaderSignatures.Contains(sig))
+                    {
+                        continue;
+                    }
+
+                    if (IsColumnHeaderRow(row))
+                    {
+                        continue;
+                    }
+
+                    if (IsAllHeaderCells(row, headerCellTexts))
+                    {
+                        continue;
+                    }
+                }
+
+                filtered.Add(row);
+            }
+
+            return filtered;
+        }
+
+        private static bool IsColumnHeaderRow(GridRowData row)
+        {
+            int matches = 0;
+            for (int c = 0; c < row.Cells.Length; c++)
+            {
+                string txt = (row.Cells[c].Text ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(txt)) continue;
+
+                if (txt.Contains("التاريخ") || txt.Contains("فاتورة") || txt.Contains("بيان") ||
+                    txt.Contains("وحدة") || txt.Contains("كمية") || txt.Contains("فئة") ||
+                    txt.Contains("جملة") || txt.Contains("المدة") || txt.Contains("جنية") ||
+                    txt.Contains("رصيد") || txt.Contains("مدين") || txt.Contains("دائن") ||
+                    txt.ToLowerInvariant().Contains("date") || txt.ToLowerInvariant().Contains("invoice") ||
+                    txt.ToLowerInvariant().Contains("description") || txt.ToLowerInvariant().Contains("qty") ||
+                    txt.ToLowerInvariant().Contains("price") || txt.ToLowerInvariant().Contains("total"))
+                {
+                    matches++;
+                }
+            }
+            return matches >= 2;
+        }
+
+        private static string GetRowSignature(GridRowData row)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int c = 0; c < row.Cells.Length; c++)
+            {
+                string txt = (row.Cells[c].Text ?? string.Empty).Trim();
+                if (!string.IsNullOrEmpty(txt))
+                {
+                    if (sb.Length > 0) sb.Append(" | ");
+                    sb.Append(txt);
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static bool IsLikelyDataRow(GridRowData row)
+        {
+            int numericCount = 0;
+            bool hasDate = false;
+
+            for (int c = 0; c < row.Cells.Length; c++)
+            {
+                string txt = (row.Cells[c].Text ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(txt)) continue;
+
+                if ((txt.Contains("/") || txt.Contains("-") || txt.Contains(".")) &&
+                    txt.Length >= 6 && txt.Length <= 10)
+                {
+                    int digitCount = 0;
+                    for (int i = 0; i < txt.Length; i++)
+                    {
+                        if (char.IsDigit(txt[i])) digitCount++;
+                    }
+                    if (digitCount >= 4) hasDate = true;
+                }
+
+                double num;
+                if (double.TryParse(txt, NumberStyles.Any, CultureInfo.InvariantCulture, out num))
+                {
+                    numericCount++;
+                }
+            }
+
+            return hasDate || numericCount >= 2;
+        }
+
+        private static bool IsPageFooterRow(GridRowData row, int pageNum, int maxPage)
+        {
+            string sig = GetRowSignature(row);
+            if (string.IsNullOrEmpty(sig)) return false;
+
+            string lower = sig.ToLowerInvariant();
+            if (lower.Contains("صفحة") || lower.Contains("صفحه") ||
+                lower.Contains("page ") || lower.Contains("of " + maxPage))
+            {
+                return true;
+            }
+
+            if (pageNum < maxPage)
+            {
+                if (lower.Contains("ما قبله") || lower.Contains("المنقول") ||
+                    lower.Contains("carried forward") || lower.Contains("brought forward"))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsAllHeaderCells(GridRowData row, HashSet<string> headerCellTexts)
+        {
+            int nonBlank = 0;
+            int headerMatches = 0;
+
+            for (int c = 0; c < row.Cells.Length; c++)
+            {
+                string txt = (row.Cells[c].Text ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(txt)) continue;
+                nonBlank++;
+
+                if (headerCellTexts.Contains(txt) ||
+                    txt.Contains("التاريخ") || txt.Contains("فاتورة") || txt.Contains("بيان") ||
+                    txt.Contains("وحدة") || txt.Contains("كمية") || txt.Contains("فئة") ||
+                    txt.Contains("جملة") || txt.Contains("المدة") || txt.Contains("جنية") ||
+                    txt.Contains("المخزن") || txt.Contains("الشركة") || txt.Contains("سنة"))
+                {
+                    headerMatches++;
+                }
+            }
+
+            return nonBlank > 0 && headerMatches * 2 >= nonBlank;
         }
 
         private List<ColumnSpan> DiscoverColumnSpans(List<List<ExtractedTextElement>> rows)

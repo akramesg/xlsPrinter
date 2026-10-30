@@ -423,12 +423,7 @@ namespace XlsPrinter.Core
             return -1;
         }
 
-            return doc;
-        }
 
-        /// <summary>
-        /// Parses an XPS or OpenXPS print stream (standard spool format on Windows 10/11 v4 print drivers),
-        /// extracting FixedPage Glyphs, coordinates (OriginX, OriginY, FontRenderingEmSize), and Unicode text.
         /// <summary>
         /// Parses an XPS or OpenXPS print stream (standard spool format on Windows 10/11 v4 print drivers),
         /// extracting FixedPage Glyphs, coordinates (OriginX, OriginY, FontRenderingEmSize), and Unicode text.
@@ -1618,7 +1613,7 @@ namespace XlsPrinter.Core
                 }
             }
 
-            res.Text = ArabicTextHelper.NormalizeArabicText(sb.ToString(), NormalizePresentationForms, ReverseVisualArabic);
+            res.Text = sb.ToString().Trim();
             return res;
         }
 

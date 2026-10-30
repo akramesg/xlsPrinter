@@ -7,16 +7,16 @@ echo ============================================================
 
 if not exist "bin" mkdir "bin"
 
+set CSC40=C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe
 set CSC35=C:\Windows\Microsoft.NET\Framework\v3.5\csc.exe
 set CSC20=C:\Windows\Microsoft.NET\Framework\v2.0.50727\csc.exe
-set CSC40=C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe
 
-if exist "%CSC35%" (
-    set CSC=%CSC35%
-) else if exist "%CSC20%" (
-    set CSC=%CSC20%
-) else (
+if exist "%CSC40%" (
     set CSC=%CSC40%
+) else if exist "%CSC35%" (
+    set CSC=%CSC35%
+) else (
+    set CSC=%CSC20%
 )
 
 echo Using Compiler: %CSC%
@@ -48,4 +48,3 @@ if exist "\\mailserver\Shared\akram" (
     copy /Y "bin\XlsVirtualPrinter.exe.config" "\\mailserver\Shared\akram\XlsVirtualPrinter.exe.config" >nul
     echo [SYNC] Updated \\mailserver\Shared\akram\XlsVirtualPrinter.exe
 )
-exit /b 0

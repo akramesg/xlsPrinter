@@ -39,6 +39,7 @@ namespace XlsPrinter.UI
         private CheckBox _chkReverseColumns;
         private CheckBox _chkReverseVisualArabic;
         private CheckBox _chkNormalizeArabicForms;
+        private CheckBox _chkEliminateHeaders;
         private NumericUpDown _numRowTol;
         private NumericUpDown _numColTol;
         private Label _lblSelectionInfo;
@@ -157,14 +158,14 @@ namespace XlsPrinter.UI
             // Options Panel (Right / Top of Grid)
             Panel optionsPanel = new Panel();
             optionsPanel.Dock = DockStyle.Top;
-            optionsPanel.Height = 115;
+            optionsPanel.Height = 140;
             optionsPanel.BackColor = Color.FromArgb(244, 246, 250);
             optionsPanel.Padding = new Padding(8);
 
             GroupBox grpArabic = new GroupBox();
             grpArabic.Text = "Arabic & Layout Options";
             grpArabic.Location = new Point(8, 6);
-            grpArabic.Size = new Size(440, 100);
+            grpArabic.Size = new Size(440, 124);
 
             _chkRtlSheet = new CheckBox();
             _chkRtlSheet.Text = "Right-to-Left (RTL) Excel Sheet View";
@@ -185,6 +186,16 @@ namespace XlsPrinter.UI
             _chkNormalizeArabicForms.AutoSize = true;
             _chkNormalizeArabicForms.Location = new Point(12, 70);
             _chkNormalizeArabicForms.CheckedChanged += delegate { ReloadDocumentWithArabicSettings(); };
+
+            _chkEliminateHeaders = new CheckBox();
+            _chkEliminateHeaders.Text = "Eliminate Repeated Headers & Footers";
+            _chkEliminateHeaders.Checked = true;
+            _chkEliminateHeaders.AutoSize = true;
+            _chkEliminateHeaders.Location = new Point(12, 94);
+            _chkEliminateHeaders.CheckedChanged += delegate {
+                _layoutEngine.EliminateRepeatedHeadersAndFooters = _chkEliminateHeaders.Checked;
+                RebuildTableFromDocument();
+            };
 
             _chkReverseVisualArabic = new CheckBox();
             _chkReverseVisualArabic.Text = "Reverse Visual Arabic Chars";
@@ -230,14 +241,14 @@ namespace XlsPrinter.UI
             };
 
             grpArabic.Controls.AddRange(new Control[] {
-                _chkRtlSheet, _chkReverseColumns, _chkNormalizeArabicForms,
+                _chkRtlSheet, _chkReverseColumns, _chkNormalizeArabicForms, _chkEliminateHeaders,
                 _chkReverseVisualArabic, lblRowTol, _numRowTol, lblColTol, _numColTol
             });
 
             GroupBox grpColumns = new GroupBox();
             grpColumns.Text = "Columns to Export (Check/Uncheck)";
             grpColumns.Location = new Point(456, 6);
-            grpColumns.Size = new Size(260, 100);
+            grpColumns.Size = new Size(260, 124);
 
             _columnsCheckList = new CheckedListBox();
             _columnsCheckList.Dock = DockStyle.Fill;
@@ -547,6 +558,9 @@ namespace XlsPrinter.UI
             if (_currentDocument == null) return;
 
             _layoutEngine.ReverseColumnsForRtl = _chkReverseColumns.Checked;
+            _layoutEngine.EliminateRepeatedHeadersAndFooters = _chkEliminateHeaders.Checked;
+            _layoutEngine.ReverseVisualArabic = _chkReverseVisualArabic.Checked;
+            _layoutEngine.NormalizePresentationForms = _chkNormalizeArabicForms.Checked;
             _currentTable = _layoutEngine.BuildTable(_currentDocument, 0, _selectionRegionMm);
 
             ApplyReconstructedTableToGrid();
